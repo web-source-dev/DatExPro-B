@@ -763,7 +763,7 @@ app.delete('/admin/users/bulk/cookies', validateApiAccess, validateChallengeToke
 // GET /contact-info - Get contact information
 app.get('/contact-info', (req, res) => {
   res.json({
-    phone: "+92 (318) 334-2804, +92 (304) 967-2196"
+    phone: "+92 (318) 334-2804, +92 (304) 967-2196 on Whatsapp"
   });
 });
 
