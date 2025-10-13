@@ -760,6 +760,13 @@ app.delete('/admin/users/bulk/cookies', validateApiAccess, validateChallengeToke
   }
 });
 
+// GET /contact-info - Get contact information
+app.get('/contact-info', (req, res) => {
+  res.json({
+    phone: "+92 318-3342804"
+  });
+});
+
 // GET /health - Health check endpoint
 app.get('/health', async (req, res) => {
   try {
