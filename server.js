@@ -396,9 +396,21 @@ app.get('/getCookies', validateApiAccess, validateChallengeToken, validateSecret
   try {
     const { domain } = req.query;
     const secretKey = req.secretKey;
+    const user = req.authenticatedUser;
+    const deviceId = req.extensionDeviceId || null;
     
     if (!domain) {
       return res.status(400).json({ error: 'Domain parameter is required' });
+    }
+
+    if (req.clientType === 'extension') {
+      if (!deviceId) {
+        return res.status(400).json({ error: 'Access denied' });
+      }
+
+      if (!user || !user.extensionDeviceIdHash) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
     }
     
     const cookieData = await CookieData.findOne({ secretKey, domain });
@@ -414,7 +426,14 @@ app.get('/getCookies', validateApiAccess, validateChallengeToken, validateSecret
       domain: domain,
       cookies: cookieData.cookies,
       lastUpdated: cookieData.lastUpdated,
-      count: cookieData.cookies.length
+      count: cookieData.cookies.length,
+      deviceVerification: req.clientType === 'extension'
+        ? {
+            registeredAt: user?.extensionDeviceRegisteredAt,
+            lastSeen: user?.extensionDeviceLastSeen,
+            deviceBound: Boolean(user?.extensionDeviceIdHash)
+          }
+        : null
     });
   } catch (error) {
     console.error('Error getting cookies:', error);
