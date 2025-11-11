@@ -7,6 +7,7 @@ const dotenv = require('dotenv');
 dotenv.config();
 
 const app = express();
+app.set('trust proxy', true);
 const PORT = process.env.PORT || 5000;
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/cookie-manager';
 
@@ -59,6 +60,37 @@ setInterval(() => {
     }
   }
 }, 60000); // Clean every minute
+
+function normalizeIp(ip) {
+  if (!ip || typeof ip !== 'string') {
+    return '';
+  }
+  return ip.replace('::ffff:', '').trim();
+}
+
+function getClientIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) {
+    const forwardedIps = Array.isArray(forwarded) ? forwarded : forwarded.split(',');
+    if (forwardedIps.length > 0) {
+      return normalizeIp(forwardedIps[0]);
+    }
+  }
+  
+  if (req.ip) {
+    return normalizeIp(req.ip);
+  }
+  
+  if (req.connection && req.connection.remoteAddress) {
+    return normalizeIp(req.connection.remoteAddress);
+  }
+  
+  if (req.socket && req.socket.remoteAddress) {
+    return normalizeIp(req.socket.remoteAddress);
+  }
+  
+  return '';
+}
 
 // Rate limiting middleware
 function rateLimiter(req, res, next) {
@@ -164,6 +196,7 @@ function validateApiAccess(req, res, next) {
   const apiSecret = req.headers['x-api-secret'];
   const clientType = req.headers['x-client-type'];
   const extensionId = req.headers['x-extension-id'];
+  const deviceIdHeader = req.headers['x-device-id'];
   
   // Check if client type is valid
   if (clientType !== 'extension' && clientType !== 'admin') {
@@ -183,6 +216,14 @@ function validateApiAccess(req, res, next) {
   
   // For extension requests, validate extension ID (optional but recommended)
   if (clientType === 'extension') {
+    const sanitizedDeviceId = typeof deviceIdHeader === 'string' ? deviceIdHeader.trim() : '';
+    
+    if (!sanitizedDeviceId || sanitizedDeviceId.length < 10) {
+      return res.status(400).json({
+        error: 'Forbidden: Device identifier is required'
+      });
+    }
+    
     // Extension ID validation - you can whitelist specific extension IDs
     // For unpacked extensions, the ID changes, so we'll allow any chrome-extension origin
     const origin = req.headers.origin || req.headers.referer;
@@ -195,9 +236,11 @@ function validateApiAccess(req, res, next) {
     
     // Extension relies on user secret key validation (validateSecretKey middleware)
     // No shared secret required - each user has their own secret key
+    req.deviceId = sanitizedDeviceId;
   }
   
   req.clientType = clientType;
+  req.extensionId = extensionId;
   next();
 }
 
@@ -212,6 +255,13 @@ const userSchema = new mongoose.Schema({
   secretKey: { type: String, required: true, unique: true },
   role: { type: String, enum: ['admin', 'user'], default: 'user' },
   blocked: { type: Boolean, default: false },
+  deviceBinding: {
+    deviceId: { type: String },
+    firstSeenAt: { type: Date },
+    lastSeenAt: { type: Date },
+    firstIp: { type: String },
+    lastIp: { type: String }
+  },
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -250,15 +300,78 @@ async function validateSecretKey(req, res, next) {
     return res.status(400).json({ error: 'Secret key must be a non-empty string' });
   }
   
+  const trimmedKey = key.trim();
+  
   try {
-    // Check if user is blocked
-    const user = await User.findOne({ secretKey: key.trim() });
+    const user = await User.findOne({ secretKey: trimmedKey });
     
-    if (user && user.blocked) {
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    if (user.blocked) {
       return res.status(403).json({ error: 'Access blocked. Contact administrator.' });
     }
     
-    req.secretKey = key.trim();
+    const clientType = req.clientType || 'extension';
+    const now = new Date();
+    const clientIp = getClientIp(req);
+    const deviceIdFromRequest = (() => {
+      if (typeof req.deviceId === 'string' && req.deviceId.trim().length > 0) {
+        return req.deviceId.trim().slice(0, 128);
+      }
+      
+      const headerDeviceId = req.headers['x-device-id'];
+      if (typeof headerDeviceId === 'string' && headerDeviceId.trim().length > 0) {
+        return headerDeviceId.trim().slice(0, 128);
+      }
+      
+      return '';
+    })();
+    
+    let shouldSaveUser = false;
+    
+    if (clientType === 'extension') {
+      if (!deviceIdFromRequest || deviceIdFromRequest.length < 10) {
+        return res.status(400).json({ error: 'Device identifier is required' });
+      }
+      
+      if (user.deviceBinding && user.deviceBinding.deviceId) {
+        if (user.deviceBinding.deviceId !== deviceIdFromRequest) {
+          return res.status(403).json({ error: 'Access denied for this device. Please contact support.' });
+        }
+        
+        if (user.deviceBinding.firstIp && clientIp && user.deviceBinding.firstIp !== clientIp) {
+          return res.status(403).json({ error: 'Access denied from unregistered network. Please contact support.' });
+        }
+        
+        user.deviceBinding.lastSeenAt = now;
+        if (clientIp) {
+          user.deviceBinding.lastIp = clientIp;
+        }
+        shouldSaveUser = true;
+      } else {
+        user.deviceBinding = {
+          deviceId: deviceIdFromRequest,
+          firstSeenAt: now,
+          lastSeenAt: now,
+          firstIp: clientIp || null,
+          lastIp: clientIp || null
+        };
+        shouldSaveUser = true;
+      }
+    }
+    
+    if (shouldSaveUser) {
+      await user.save();
+    }
+    
+    req.secretKey = trimmedKey;
+    req.user = user;
+    if (deviceIdFromRequest) {
+      req.deviceId = deviceIdFromRequest;
+    }
+    req.clientIp = clientIp;
     next();
   } catch (error) {
     console.error('Error validating secret key:', error);
@@ -296,11 +409,7 @@ app.get('/auth/userinfo', validateApiAccess, validateChallengeToken, validateSec
   try {
     const secretKey = req.secretKey;
     
-    const user = await User.findOne({ secretKey });
-    
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    const user = req.user || await User.findOne({ secretKey });
     
     res.json({
       id: user._id,
